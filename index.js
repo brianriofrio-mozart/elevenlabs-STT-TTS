@@ -6,6 +6,10 @@ import {
   RealtimeEvents,
   AudioFormat,
 } from "@elevenlabs/elevenlabs-js";
+import {
+  BedrockAgentRuntimeClient,
+  InvokeAgentCommand,
+} from "@aws-sdk/client-bedrock-agent-runtime";
 
 const app = express();
 const server = app.listen(3001, () => {
@@ -18,287 +22,319 @@ const elevenlabs = new ElevenLabsClient({
   apiKey: process.env.ELEVENLABS_API_KEY,
 });
 
-async function callBedrockAgent(text, sessionId) {
-  const response = await fetch(process.env.BEDROCK_API_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
+const bedrockClient = new BedrockAgentRuntimeClient({
+  region: process.env.AWS_REGION || "us-east-1",
+  credentials: {
+    accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+    secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+  },
+});
+
+async function* streamBedrockAgent(text, sessionId) {
+  const finalSessionId = sessionId || `session-${Date.now()}-${Math.random().toString(36).substring(7)}`;
+  
+  const command = new InvokeAgentCommand({
+    agentId: process.env.BEDROCK_AGENT_ID,
+    agentAliasId: process.env.BEDROCK_AGENT_ALIAS_ID,
+    sessionId: finalSessionId,
+    inputText: text,
+    enableTrace: false,
+    streamingConfigurations: {
+      streamFinalResponse: true,
     },
-    body: JSON.stringify({
-      inputText: text,
-      sessionId, // MUY IMPORTANTE para mantener contexto
-    }),
   });
 
-  if (!response.ok) {
-    const errText = await response.text();
-    throw new Error(`Bedrock error: ${errText}`);
-  }
-
-  const data = await response.json();
-  return data;
-}
-
-
-async function streamTextToSpeech(text, clientWs) {
-  console.log("🔊 TTS start:", text);
-  
   try {
-    const audioStream = await elevenlabs.textToSpeech.stream(
-      "JBFqnCBsd6RMkjVDRZzb", // voiceId
-      {
-        modelId: "eleven_multilingual_v2",
-        text,
-        outputFormat: "mp3_44100_128",
-        voiceSettings: {
-          stability: 0,
-          similarityBoost: 1.0,
-          useSpeakerBoost: true,
-          speed: 1.0,
-        },
-      }
-    );
+    const response = await bedrockClient.send(command);
+    let accumulatedText = "";
 
-    // Opción 1: Acumular y enviar completo (mejor para chunks pequeños)
-    const chunks = [];
-    for await (const chunk of audioStream) {
-      chunks.push(chunk);
+    for await (const event of response.completion) {
+      if (event.chunk?.bytes) {
+        const decodedChunk = new TextDecoder().decode(event.chunk.bytes);
+        accumulatedText += decodedChunk;
+        
+        yield {
+          type: "chunk",
+          text: decodedChunk,
+          accumulated: accumulatedText,
+        };
+      }
     }
-    
-    // Concatenar todos los chunks en un solo buffer
-    const completeAudio = Buffer.concat(chunks);
-    console.log(`✅ TTS complete - ${completeAudio.length} bytes total`);
-    
-    // Enviar el audio completo
-    clientWs.send(completeAudio);
-    
-    clientWs.send(
-      JSON.stringify({
-        type: "tts_audio_end",
-      })
-    );
-    
-  } catch (err) {
-    console.error("❌ TTS error:", err);
-    clientWs.send(
-      JSON.stringify({
-        type: "error",
-        error: "TTS failed",
-      })
-    );
+
+    yield {
+      type: "complete",
+      text: accumulatedText,
+      sessionId: finalSessionId,
+    };
+  } catch (error) {
+    console.error("❌ Bedrock error:", error);
+    throw error;
   }
 }
 
-// Opción 2: Streaming con chunks más grandes (mejor para latencia baja)
-async function streamTextToSpeechChunked(text, clientWs) {
-  console.log("🔊 TTS start:", text);
-  
+async function streamTextToSpeechPCM(text, clientWs) {
   try {
     const audioStream = await elevenlabs.textToSpeech.stream(
-      "JBFqnCBsd6RMkjVDRZzb",
+      "gKg8M8yuhJHaZpgdtyrn",
       {
-        modelId: "eleven_multilingual_v2",
+        modelId: "eleven_turbo_v2_5",
+        languageCode: "es",
         text,
-        outputFormat: "mp3_44100_128",
+        outputFormat: "pcm_24000",
         voiceSettings: {
-          stability: 0,
-          similarityBoost: 1.0,
+          stability: 0.5,
+          similarityBoost: 0.8,
           useSpeakerBoost: true,
-          speed: 1.0,
+          speed: 1.05,
         },
       }
     );
 
     clientWs.send(
       JSON.stringify({
-        type: "tts_audio_start"
+        type: "tts_audio_start",
+        format: "pcm",
+        sampleRate: 24000,
+        channels: 1,
+        bitDepth: 16,
       })
     );
 
-    let chunkCount = 0;
     let buffer = [];
-    const MIN_CHUNK_SIZE = 8192; // Acumular al menos 8KB antes de enviar
+    const MIN_CHUNK_SIZE = 4096;
 
     for await (const chunk of audioStream) {
       buffer.push(chunk);
       const bufferSize = buffer.reduce((acc, c) => acc + c.length, 0);
       
-      // Enviar cuando tengamos suficiente data
       if (bufferSize >= MIN_CHUNK_SIZE) {
-        const combined = Buffer.concat(buffer);
-        chunkCount++;
-        console.log(`📦 Sending TTS chunk #${chunkCount} - ${combined.length} bytes`);
-        clientWs.send(combined);
+        clientWs.send(Buffer.concat(buffer));
         buffer = [];
       }
     }
 
-    // Enviar lo que queda en el buffer
     if (buffer.length > 0) {
-      const combined = Buffer.concat(buffer);
-      chunkCount++;
-      console.log(`📦 Sending final TTS chunk #${chunkCount} - ${combined.length} bytes`);
-      clientWs.send(combined);
+      clientWs.send(Buffer.concat(buffer));
     }
 
-    console.log(`✅ TTS finished - ${chunkCount} total chunks sent`);
-
-    clientWs.send(
-      JSON.stringify({
-        type: "tts_audio_end",
-      })
-    );
-    
+    clientWs.send(JSON.stringify({ type: "tts_audio_end" }));
   } catch (err) {
     console.error("❌ TTS error:", err);
-    clientWs.send(
-      JSON.stringify({
-        type: "error",
-        error: "TTS failed",
-      })
-    );
+    clientWs.send(JSON.stringify({ type: "error", error: "TTS failed" }));
   }
+}
+
+function extractCompleteSentences(text) {
+  const MIN_LENGTH = 8;
+  const matches = [...text.matchAll(/[.!?:]+(?:\s+|$)|,(?=\s+[A-Z])/g)];
+  
+  if (matches.length === 0) {
+    if (text.length > 100) {
+      const lastComma = Math.max(text.lastIndexOf(','), text.lastIndexOf(';'), text.lastIndexOf(':'));
+      if (lastComma > 60) {
+        return {
+          sentences: text.substring(0, lastComma + 1).trim(),
+          remaining: text.substring(lastComma + 1).trim()
+        };
+      }
+    }
+    return { sentences: "", remaining: text };
+  }
+  
+  const lastMatch = matches[matches.length - 1];
+  const lastIndex = lastMatch.index + lastMatch[0].length;
+  const sentences = text.substring(0, lastIndex).trim();
+  const remaining = text.substring(lastIndex).trim();
+  
+  if (sentences.length < MIN_LENGTH ) {
+    return { sentences: "", remaining: text };
+  }
+  
+  return { sentences, remaining };
 }
 
 wss.on("connection", async (clientWs) => {
   console.log("✅ Client connected");
-  let elevenConnected = true;
 
-  // 1️⃣ Abrimos conexión realtime con ElevenLabs
-  const connection = await elevenlabs.speechToText.realtime.connect({
-    modelId: "scribe_v2_realtime",
-    audioFormat: AudioFormat.PCM_16000,
-    sampleRate: 16000,
-    languageCode: "es",
-    includeTimestamps: true,
-    commitStrategy: "vad",
-    vadThreshold: 0.75,
-    vadSilenceThresholdSecs: 0.4,
-    minSpeechDurationMs: 150,
-    minSilenceDurationMs: 300,
-  });
-
-  // 2️⃣ Eventos desde ElevenLabs → frontend
-  connection.on(RealtimeEvents.SESSION_STARTED, (data) => {
-    console.log("🎙️ ElevenLabs session started", data);
-  });
-
-  connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT, (transcript) => {
-    clientWs.send(
-      JSON.stringify({
-        type: "partial",
-        data: transcript,
-      })
-    );
-  });
-
+  let connection = null;
+  let isConnected = false;
+  let keepAliveInterval = null;
+  let lastAudioTime = Date.now();
   let sessionId = null;
-  connection.on(RealtimeEvents.COMMITTED_TRANSCRIPT, async (transcript) => {
-    clientWs.send(
-      JSON.stringify({
-        type: "final",
-        data: transcript,
-      })
-    );
-    
-    const text = transcript.text?.trim();
-    console.log("📝 FINAL TEXT:", text);
 
-    if (!text) return;
+  try {
+    connection = await elevenlabs.speechToText.realtime.connect({
+      modelId: "scribe_v2_realtime",
+      audioFormat: AudioFormat.PCM_16000,
+      sampleRate: 16000,
+      languageCode: "es",
+      includeTimestamps: true,
+      commitStrategy: "vad",
+      vadThreshold: 0.75,
+      vadSilenceThresholdSecs: 0.4,
+      minSpeechDurationMs: 150,
+      minSilenceDurationMs: 300,
+    });
 
-    try {
-      clientWs.send(JSON.stringify({
-        type: "thinking"
-      }));
+    isConnected = true;
 
-      // 1️⃣ Enviar texto a Bedrock
-      const bedrockResponse = await callBedrockAgent(text, sessionId);
+    keepAliveInterval = setInterval(() => {
+      if (!isConnected || !connection) return;
 
-      sessionId = bedrockResponse.sessionId;
-      const agentText = bedrockResponse.response;
+      const timeSinceLastAudio = Date.now() - lastAudioTime;
+      
+      if (timeSinceLastAudio > 2000) {
+        try {
+          const silenceBuffer = Buffer.alloc(1024, 0);
+          connection.send({
+            audioBase64: silenceBuffer.toString("base64"),
+            sampleRate: 16000,
+          });
+        } catch (err) {
+          console.error("❌ Keep-alive error:", err);
+        }
+      }
+    }, 2000);
 
-      clientWs.send(JSON.stringify({
-        type: "agent_text",
-        text: agentText,
-      }));
+    connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT, (transcript) => {
+      clientWs.send(JSON.stringify({ type: "partial", data: transcript }));
+    });
 
-      console.log("🤖 Bedrock:", agentText);
+    connection.on(RealtimeEvents.COMMITTED_TRANSCRIPT, async (transcript) => {
+      clientWs.send(JSON.stringify({ type: "final", data: transcript }));
+      
+      const text = transcript.text?.trim();
+      if (!text) return;
 
-      // 2️⃣ Enviar respuesta por TTS
-      await streamTextToSpeech(agentText, clientWs);
-
-    } catch (err) {
-      console.error("❌ Bedrock/TTS error", err);
-      clientWs.send(JSON.stringify({
-        type: "error",
-        error: "Agent failed",
-      }));
-    }
-  });
-
-  connection.on(
-    RealtimeEvents.COMMITTED_TRANSCRIPT_WITH_TIMESTAMPS,
-    (transcript) => {
-      clientWs.send(
-        JSON.stringify({
-          type: "final_with_timestamps",
-          data: transcript,
-        })
-      );
-    }
-  );
-
-  connection.on(RealtimeEvents.ERROR, (error) => {
-    console.error("❌ ElevenLabs error", error);
-    clientWs.send(
-      JSON.stringify({
-        type: "error",
-        error,
-      })
-    );
-  });
-
-  connection.on(RealtimeEvents.CLOSE, () => {
-    console.log("🔌 ElevenLabs connection closed");
-    elevenConnected = false;
-  });
-
-  // 3️⃣ Audio desde frontend → ElevenLabs
-  clientWs.on("message", (message) => {
-    // Mensajes de control (JSON)
-    if (typeof message === "string") {
       try {
-        const data = JSON.parse(message);
+        clientWs.send(JSON.stringify({ type: "thinking" }));
 
-        if (data.event === "stop" && elevenConnected) {
-          console.log("⏹️ Commit requested");
-          connection.commit();
+        let pendingText = "";
+        let ttsQueue = Promise.resolve();
+
+        for await (const event of streamBedrockAgent(text, sessionId)) {
+          if (event.type === "chunk") {
+            pendingText += event.text;
+
+            clientWs.send(JSON.stringify({
+              type: "agent_text_chunk",
+              chunk: event.text,
+              accumulated: event.accumulated,
+            }));
+
+            const { sentences, remaining } = extractCompleteSentences(pendingText);
+            
+            if (sentences) {
+              ttsQueue = ttsQueue.then(() => 
+                streamTextToSpeechPCM(sentences, clientWs)
+              );
+              pendingText = remaining;
+            }
+          }
+          
+          if (event.type === "complete") {
+            sessionId = event.sessionId;
+            
+            if (pendingText.trim()) {
+              ttsQueue = ttsQueue.then(() =>
+                streamTextToSpeechPCM(pendingText, clientWs)
+              );
+            }
+
+            await ttsQueue;
+
+            clientWs.send(JSON.stringify({
+              type: "agent_complete",
+              text: event.text,
+            }));
+          }
         }
       } catch (err) {
-        console.error("❌ Error parsing message:", err);
+        console.error("❌ Error:", err);
+        clientWs.send(JSON.stringify({
+          type: "error",
+          error: err.message || "Agent failed",
+        }));
+      }
+    });
+
+    connection.on(RealtimeEvents.ERROR, (error) => {
+      console.error("❌ ElevenLabs error:", error);
+      clientWs.send(JSON.stringify({ type: "error", error }));
+    });
+
+    connection.on(RealtimeEvents.CLOSE, () => {
+      console.log("🔌 ElevenLabs connection closed");
+      isConnected = false;
+      
+      if (keepAliveInterval) {
+        clearInterval(keepAliveInterval);
+        keepAliveInterval = null;
+      }
+    });
+
+    clientWs.on("message", (message) => {
+      if (typeof message === "string") {
+        try {
+          const data = JSON.parse(message);
+          if (data.event === "stop" && isConnected && connection) {
+            connection.commit();
+          }
+        } catch (err) {
+          console.error("❌ Error parsing message:", err);
+        }
+        return;
       }
 
-      return;
-    }
+      if (!isConnected || !connection) return;
 
-    // Audio chunk (Buffer PCM16)
-    if (!elevenConnected) {
-      return;
-    }
+      lastAudioTime = Date.now();
 
-    const audioBuffer = Buffer.from(message);
-    const audioBase64 = audioBuffer.toString("base64");
-
-    connection.send({
-      audioBase64,
-      sampleRate: 16000,
+      try {
+        const audioBuffer = Buffer.from(message);
+        connection.send({
+          audioBase64: audioBuffer.toString("base64"),
+          sampleRate: 16000,
+        });
+      } catch (err) {
+        console.error("❌ Error sending audio:", err);
+        isConnected = false;
+      }
     });
-  });
 
-  clientWs.on("close", () => {
-    console.log("❌ Client disconnected");
-    if (elevenConnected) {
-      connection.close();
+    clientWs.on("close", () => {
+      console.log("❌ Client disconnected");
+
+      if (keepAliveInterval) {
+        clearInterval(keepAliveInterval);
+        keepAliveInterval = null;
+      }
+
+      if (isConnected && connection) {
+        try {
+          connection.close();
+        } catch (err) {
+          console.error("Error closing connection:", err.message);
+        }
+      }
+
+      isConnected = false;
+    });
+
+  } catch (err) {
+    console.error("❌ Failed to establish connection:", err);
+    isConnected = false;
+
+    if (keepAliveInterval) {
+      clearInterval(keepAliveInterval);
     }
-  });
+    
+    if (clientWs.readyState === clientWs.OPEN) {
+      clientWs.send(JSON.stringify({
+        type: "error",
+        error: "Failed to connect to speech service",
+      }));
+      clientWs.close();
+    }
+  }
 });
