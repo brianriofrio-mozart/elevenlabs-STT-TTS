@@ -72,6 +72,7 @@ async function* streamBedrockAgent(text, sessionId) {
   }
 }
 
+// 🆕 FUNCIÓN MEJORADA CON ALINEACIÓN CORRECTA
 async function streamTextToSpeechPCM(text, clientWs) {
   try {
     const audioStream = await elevenlabs.textToSpeech.stream(
@@ -101,23 +102,81 @@ async function streamTextToSpeechPCM(text, clientWs) {
     );
 
     let buffer = [];
-    const MIN_CHUNK_SIZE = 4096;
+    let leftoverByte = null; // 🆕 Para manejar bytes impares
+    
+    // 🆕 Configuración optimizada
+    const MIN_CHUNK_SIZE = 4096;  // Mínimo para enviar (múltiplo de 2)
+    const MAX_BUFFER_SIZE = 12288; // Máximo antes de forzar envío
+    const CHUNK_TIMEOUT = 50; // ms máximo de espera
+
+    let lastSendTime = Date.now();
 
     for await (const chunk of audioStream) {
+      // 🆕 Validar que el chunk no esté vacío
+      if (!chunk || chunk.length === 0) {
+        console.warn("⚠️ ElevenLabs sent empty chunk, skipping");
+        continue;
+      }
+
       buffer.push(chunk);
       const bufferSize = buffer.reduce((acc, c) => acc + c.length, 0);
+      const timeSinceLastSend = Date.now() - lastSendTime;
       
-      if (bufferSize >= MIN_CHUNK_SIZE) {
-        clientWs.send(Buffer.concat(buffer));
+      // 🆕 Enviar si cumple condiciones: tamaño O timeout
+      const shouldSend = bufferSize >= MIN_CHUNK_SIZE || 
+                        bufferSize >= MAX_BUFFER_SIZE ||
+                        (bufferSize > 0 && timeSinceLastSend > CHUNK_TIMEOUT);
+      
+      if (shouldSend) {
+        let combined = Buffer.concat(buffer);
+        
+        // 🆕 Combinar con leftover byte si existe
+        if (leftoverByte !== null) {
+          combined = Buffer.concat([Buffer.from([leftoverByte]), combined]);
+          leftoverByte = null;
+        }
+        
+        // 🆕 CRÍTICO: Asegurar alineación a 16-bit (par)
+        if (combined.length % 2 !== 0) {
+          // Guardar último byte para el siguiente chunk
+          leftoverByte = combined[combined.length - 1];
+          combined = combined.slice(0, -1);
+          
+          console.log(`🔧 Aligned chunk: ${combined.length + 1} → ${combined.length} bytes (saved 1 byte)`);
+        }
+        
+        // Solo enviar si hay datos después de alinear
+        if (combined.length > 0) {
+          clientWs.send(combined);
+          lastSendTime = Date.now();
+        }
+        
         buffer = [];
       }
     }
 
-    if (buffer.length > 0) {
-      clientWs.send(Buffer.concat(buffer));
+    // 🆕 Procesar buffer final
+    if (buffer.length > 0 || leftoverByte !== null) {
+      let combined = buffer.length > 0 ? Buffer.concat(buffer) : Buffer.alloc(0);
+      
+      if (leftoverByte !== null) {
+        combined = Buffer.concat([Buffer.from([leftoverByte]), combined]);
+        leftoverByte = null;
+      }
+      
+      // Alinear chunk final
+      if (combined.length % 2 !== 0) {
+        console.warn(`⚠️ Final chunk unaligned (${combined.length}B), truncating last byte`);
+        combined = combined.slice(0, -1);
+      }
+      
+      if (combined.length > 0) {
+        clientWs.send(combined);
+      }
     }
 
     clientWs.send(JSON.stringify({ type: "tts_audio_end" }));
+    
   } catch (err) {
     console.error("❌ TTS error:", err);
     clientWs.send(JSON.stringify({ type: "error", error: "TTS failed" }));
