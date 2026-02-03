@@ -72,6 +72,21 @@ async function* streamBedrockAgent(text, sessionId) {
   }
 }
 
+function cleanTextForTTS(text) {
+  const cleanedText = text
+    .replace(/\\n+/g, ' ')
+    .replace(/\n+/g, ' ')
+    .replace(/\t+/g, ' ')
+    .replace(/\r/g, '')
+    .replace(/<[^>]+>.*?<\/[^>]+>/gs, '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/[*_~`]/g, '')
+    .trim();
+  return cleanedText;
+}
+
+
 // 🆕 FUNCIÓN MEJORADA CON ALINEACIÓN CORRECTA
 async function streamTextToSpeechPCM(text, clientWs) {
   try {
@@ -275,18 +290,32 @@ wss.on("connection", async (clientWs) => {
           if (event.type === "chunk") {
             pendingText += event.text;
 
+            const cleanedChunk = cleanTextForTTS(event.text);
+            const cleanedAccumulated = cleanTextForTTS(event.accumulated);
+
             clientWs.send(JSON.stringify({
               type: "agent_text_chunk",
-              chunk: event.text,
-              accumulated: event.accumulated,
+              chunk: cleanedChunk, 
+              accumulated: cleanedAccumulated,
             }));
 
             const { sentences, remaining } = extractCompleteSentences(pendingText);
             
             if (sentences) {
-              ttsQueue = ttsQueue.then(() => 
-                streamTextToSpeechPCM(sentences, clientWs)
-              );
+              const cleanedSentences = cleanTextForTTS(sentences);
+
+              if (cleanedSentences) {
+                // 🆕 1️⃣ Mandar al front el texto que se va a oír
+                clientWs.send(JSON.stringify({
+                  type: "agent_tts_text",
+                  text: cleanedSentences
+                }));
+
+                // 🆕 2️⃣ Mandar ese MISMO texto al TTS
+                ttsQueue = ttsQueue.then(() =>
+                  streamTextToSpeechPCM(cleanedSentences, clientWs)
+                );
+              }
               pendingText = remaining;
             }
           }
@@ -295,16 +324,24 @@ wss.on("connection", async (clientWs) => {
             sessionId = event.sessionId;
             
             if (pendingText.trim()) {
-              ttsQueue = ttsQueue.then(() =>
-                streamTextToSpeechPCM(pendingText, clientWs)
-              );
+              const cleanedPending = cleanTextForTTS(pendingText);
+              if (cleanedPending) {
+                clientWs.send(JSON.stringify({
+                  type: "agent_tts_text",
+                  text: cleanedPending
+                }));
+
+                ttsQueue = ttsQueue.then(() =>
+                  streamTextToSpeechPCM(cleanedPending, clientWs)
+                );
+              }
             }
 
             await ttsQueue;
 
             clientWs.send(JSON.stringify({
               type: "agent_complete",
-              text: event.text,
+              text: cleanTextForTTS(event.text),
             }));
           }
         }
