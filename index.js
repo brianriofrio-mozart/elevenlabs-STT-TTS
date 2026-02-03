@@ -1,5 +1,6 @@
 import "dotenv/config";
 import express from "express";
+import cors from "cors";
 import { WebSocketServer } from "ws";
 import {
   ElevenLabsClient,
@@ -12,6 +13,16 @@ import {
 } from "@aws-sdk/client-bedrock-agent-runtime";
 
 const app = express();
+
+app.use(cors({
+  origin: [
+    'https://elevenlabs-front-six.vercel.app',
+    'http://localhost:5173',
+    'http://localhost:3000'
+  ],
+  methods: ['GET', 'POST', 'OPTIONS'],
+  credentials: true
+}));
 
 // 🆕 Health check endpoint
 app.get('/health', (req, res) => {
