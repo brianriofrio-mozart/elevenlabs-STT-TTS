@@ -12,6 +12,12 @@ import {
 } from "@aws-sdk/client-bedrock-agent-runtime";
 
 const app = express();
+
+// 🆕 Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
+
 const server = app.listen(3001, () => {
   console.log("Server listening on http://localhost:3001");
 });
@@ -29,6 +35,27 @@ const bedrockClient = new BedrockAgentRuntimeClient({
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
   },
 });
+
+// 🆕 Función auxiliar para esperar conexión con retry
+async function connectWithRetry(connectFn, maxRetries = 5, delayMs = 1000) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      console.log(`🔄 Attempting ElevenLabs connection (attempt ${i + 1}/${maxRetries})...`);
+      const connection = await connectFn();
+      console.log("✅ ElevenLabs connected successfully");
+      return connection;
+    } catch (err) {
+      console.error(`❌ Connection attempt ${i + 1} failed:`, err.message);
+      
+      if (i < maxRetries - 1) {
+        console.log(`⏳ Retrying in ${delayMs}ms...`);
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+      } else {
+        throw new Error(`Failed to connect after ${maxRetries} attempts: ${err.message}`);
+      }
+    }
+  }
+}
 
 async function* streamBedrockAgent(text, sessionId) {
   const finalSessionId = sessionId || `session-${Date.now()}-${Math.random().toString(36).substring(7)}`;
@@ -86,8 +113,6 @@ function cleanTextForTTS(text) {
   return cleanedText;
 }
 
-
-// 🆕 FUNCIÓN MEJORADA CON ALINEACIÓN CORRECTA
 async function streamTextToSpeechPCM(text, clientWs) {
   try {
     const audioStream = await elevenlabs.textToSpeech.stream(
@@ -117,17 +142,15 @@ async function streamTextToSpeechPCM(text, clientWs) {
     );
 
     let buffer = [];
-    let leftoverByte = null; // 🆕 Para manejar bytes impares
+    let leftoverByte = null;
     
-    // 🆕 Configuración optimizada
-    const MIN_CHUNK_SIZE = 4096;  // Mínimo para enviar (múltiplo de 2)
-    const MAX_BUFFER_SIZE = 12288; // Máximo antes de forzar envío
-    const CHUNK_TIMEOUT = 50; // ms máximo de espera
+    const MIN_CHUNK_SIZE = 4096;
+    const MAX_BUFFER_SIZE = 12288;
+    const CHUNK_TIMEOUT = 50;
 
     let lastSendTime = Date.now();
 
     for await (const chunk of audioStream) {
-      // 🆕 Validar que el chunk no esté vacío
       if (!chunk || chunk.length === 0) {
         console.warn("⚠️ ElevenLabs sent empty chunk, skipping");
         continue;
@@ -137,7 +160,6 @@ async function streamTextToSpeechPCM(text, clientWs) {
       const bufferSize = buffer.reduce((acc, c) => acc + c.length, 0);
       const timeSinceLastSend = Date.now() - lastSendTime;
       
-      // 🆕 Enviar si cumple condiciones: tamaño O timeout
       const shouldSend = bufferSize >= MIN_CHUNK_SIZE || 
                         bufferSize >= MAX_BUFFER_SIZE ||
                         (bufferSize > 0 && timeSinceLastSend > CHUNK_TIMEOUT);
@@ -145,22 +167,16 @@ async function streamTextToSpeechPCM(text, clientWs) {
       if (shouldSend) {
         let combined = Buffer.concat(buffer);
         
-        // 🆕 Combinar con leftover byte si existe
         if (leftoverByte !== null) {
           combined = Buffer.concat([Buffer.from([leftoverByte]), combined]);
           leftoverByte = null;
         }
         
-        // 🆕 CRÍTICO: Asegurar alineación a 16-bit (par)
         if (combined.length % 2 !== 0) {
-          // Guardar último byte para el siguiente chunk
           leftoverByte = combined[combined.length - 1];
           combined = combined.slice(0, -1);
-          
-          console.log(`🔧 Aligned chunk: ${combined.length + 1} → ${combined.length} bytes (saved 1 byte)`);
         }
         
-        // Solo enviar si hay datos después de alinear
         if (combined.length > 0) {
           clientWs.send(combined);
           lastSendTime = Date.now();
@@ -170,7 +186,6 @@ async function streamTextToSpeechPCM(text, clientWs) {
       }
     }
 
-    // 🆕 Procesar buffer final
     if (buffer.length > 0 || leftoverByte !== null) {
       let combined = buffer.length > 0 ? Buffer.concat(buffer) : Buffer.alloc(0);
       
@@ -179,9 +194,7 @@ async function streamTextToSpeechPCM(text, clientWs) {
         leftoverByte = null;
       }
       
-      // Alinear chunk final
       if (combined.length % 2 !== 0) {
-        console.warn(`⚠️ Final chunk unaligned (${combined.length}B), truncating last byte`);
         combined = combined.slice(0, -1);
       }
       
@@ -236,21 +249,36 @@ wss.on("connection", async (clientWs) => {
   let lastAudioTime = Date.now();
   let sessionId = null;
 
+  // 🆕 Notificar al cliente que está inicializando
+  clientWs.send(JSON.stringify({ 
+    type: "initializing", 
+    message: "Connecting to speech service..." 
+  }));
+
   try {
-    connection = await elevenlabs.speechToText.realtime.connect({
-      modelId: "scribe_v2_realtime",
-      audioFormat: AudioFormat.PCM_16000,
-      sampleRate: 16000,
-      languageCode: "es",
-      includeTimestamps: true,
-      commitStrategy: "vad",
-      vadThreshold: 0.75,
-      vadSilenceThresholdSecs: 0.4,
-      minSpeechDurationMs: 150,
-      minSilenceDurationMs: 300,
-    });
+    // 🆕 Usar la función de retry para conectar
+    connection = await connectWithRetry(async () => {
+      return await elevenlabs.speechToText.realtime.connect({
+        modelId: "scribe_v2_realtime",
+        audioFormat: AudioFormat.PCM_16000,
+        sampleRate: 16000,
+        languageCode: "es",
+        includeTimestamps: true,
+        commitStrategy: "vad",
+        vadThreshold: 0.75,
+        vadSilenceThresholdSecs: 0.4,
+        minSpeechDurationMs: 150,
+        minSilenceDurationMs: 300,
+      });
+    }, 5, 2000); // 5 intentos, 2 segundos entre cada uno
 
     isConnected = true;
+
+    // 🆕 Notificar al cliente que ya está listo
+    clientWs.send(JSON.stringify({ 
+      type: "ready", 
+      message: "Service connected and ready" 
+    }));
 
     keepAliveInterval = setInterval(() => {
       if (!isConnected || !connection) return;
@@ -305,13 +333,11 @@ wss.on("connection", async (clientWs) => {
               const cleanedSentences = cleanTextForTTS(sentences);
 
               if (cleanedSentences) {
-                // 🆕 1️⃣ Mandar al front el texto que se va a oír
                 clientWs.send(JSON.stringify({
                   type: "agent_tts_text",
                   text: cleanedSentences
                 }));
 
-                // 🆕 2️⃣ Mandar ese MISMO texto al TTS
                 ttsQueue = ttsQueue.then(() =>
                   streamTextToSpeechPCM(cleanedSentences, clientWs)
                 );
@@ -382,7 +408,11 @@ wss.on("connection", async (clientWs) => {
         return;
       }
 
-      if (!isConnected || !connection) return;
+      // 🆕 Verificar que la conexión esté lista antes de enviar audio
+      if (!isConnected || !connection) {
+        console.warn("⚠️ Audio received but connection not ready, ignoring");
+        return;
+      }
 
       lastAudioTime = Date.now();
 
@@ -418,7 +448,7 @@ wss.on("connection", async (clientWs) => {
     });
 
   } catch (err) {
-    console.error("❌ Failed to establish connection:", err);
+    console.error("❌ Failed to establish connection after all retries:", err);
     isConnected = false;
 
     if (keepAliveInterval) {
@@ -427,10 +457,15 @@ wss.on("connection", async (clientWs) => {
     
     if (clientWs.readyState === clientWs.OPEN) {
       clientWs.send(JSON.stringify({
-        type: "error",
-        error: "Failed to connect to speech service",
+        type: "connection_failed",
+        error: "Could not connect to speech service. Server may be starting up. Please refresh in a few seconds.",
       }));
-      clientWs.close();
+      // 🆕 No cerrar inmediatamente, dar tiempo al cliente para mostrar el mensaje
+      setTimeout(() => {
+        if (clientWs.readyState === clientWs.OPEN) {
+          clientWs.close();
+        }
+      }, 2000);
     }
   }
 });
