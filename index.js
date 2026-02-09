@@ -47,57 +47,6 @@ const bedrockClient = new BedrockAgentRuntimeClient({
   },
 });
 
-async function processUserIntent(text, clientWs, sessionIdState) {
-  if (!text) return;
-  
-  try {
-    clientWs.send(JSON.stringify({ type: "thinking" }));
-
-    let pendingText = "";
-    let ttsQueue = Promise.resolve();
-    let currentSessionId = sessionIdState;
-
-    // Llamada a Bedrock (mismo flujo que ya tenías)
-      for await (const event of streamBedrockAgent(text, currentSessionId)) {
-        if (event.type === "chunk") {
-          pendingText += event.text;
-
-          const { sentences, remaining } = extractCompleteSentences(pendingText);
-          
-          if (sentences) {
-            const cleaned = cleanTextForTTS(sentences);
-            if (cleaned) {
-              // 🆕 Solo enviamos al frontend cuando tenemos una oración limpia y completa
-              clientWs.send(JSON.stringify({
-                type: "agent_text_chunk", // Reutilizamos el tipo pero con texto limpio
-                accumulated: cleaned 
-              }));
-              
-              ttsQueue = ttsQueue.then(() => streamTextToSpeechPCM(cleaned, clientWs));
-            }
-            pendingText = remaining;
-          }
-        }
-      
-      if (event.type === "complete") {
-        if (pendingText.trim()) {
-          const cleanedPending = cleanTextForTTS(pendingText);
-          ttsQueue = ttsQueue.then(() => streamTextToSpeechPCM(cleanedPending, clientWs));
-        }
-        await ttsQueue;
-        clientWs.send(JSON.stringify({ 
-          type: "agent_complete", 
-          text: cleanTextForTTS(event.text) 
-        }));
-        return event.sessionId; // Retornamos el ID para mantener el hilo
-      }
-    }
-  } catch (err) {
-    console.error("❌ Error en procesamiento:", err);
-    clientWs.send(JSON.stringify({ type: "error", error: "Failed to process request" }));
-  }
-}
-
 // 🆕 Función auxiliar para esperar conexión con retry
 async function connectWithRetry(connectFn, maxRetries = 5, delayMs = 1000) {
   for (let i = 0; i < maxRetries; i++) {
@@ -303,88 +252,231 @@ function extractCompleteSentences(text) {
 }
 
 wss.on("connection", async (clientWs) => {
-    console.log("✅ Client connected");
-    let connection = null;
-    let isConnected = false;
-    let keepAliveInterval = null;
-    let lastAudioTime = Date.now();
-    let sessionId = null;
+  console.log("✅ Client connected");
 
-    clientWs.send(JSON.stringify({ type: "initializing", message: "Connecting to speech service..." }));
+  let connection = null;
+  let isConnected = false;
+  let keepAliveInterval = null;
+  let lastAudioTime = Date.now();
+  let sessionId = null;
 
-    try {
-        connection = await connectWithRetry(async () => {
-            return await elevenlabs.speechToText.realtime.connect({
-                modelId: "scribe_v2_realtime",
-                audioFormat: AudioFormat.PCM_16000,
-                sampleRate: 16000,
-                languageCode: "es",
-                commitStrategy: "vad",
-                vadThreshold: 0.75,
-                vadSilenceThresholdSecs: 1.5,
-                minSpeechDurationMs: 150,
-                minSilenceDurationMs: 600,
-            });
-        });
+  // 🆕 Notificar al cliente que está inicializando
+  clientWs.send(JSON.stringify({ 
+    type: "initializing", 
+    message: "Connecting to speech service..." 
+  }));
 
-        isConnected = true;
+  try {
+    // 🆕 Usar la función de retry para conectar
+    connection = await connectWithRetry(async () => {
+      return await elevenlabs.speechToText.realtime.connect({
+        modelId: "scribe_v2_realtime",
+        audioFormat: AudioFormat.PCM_16000,
+        sampleRate: 16000,
+        languageCode: "es",
+        includeTimestamps: true,
+        commitStrategy: "vad",
+        vadThreshold: 0.75,
+        vadSilenceThresholdSecs: 0.4,
+        minSpeechDurationMs: 150,
+        minSilenceDurationMs: 300,
+      });
+    }, 5, 2000); // 5 intentos, 2 segundos entre cada uno
 
-        connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT, (transcript) => {
-            clientWs.send(JSON.stringify({ type: "partial", data: transcript }));
-        });
+    isConnected = true;
 
-        connection.on(RealtimeEvents.COMMITTED_TRANSCRIPT, async (transcript) => {
-            clientWs.send(JSON.stringify({ type: "final", data: transcript }));
-            sessionId = await processUserIntent(transcript.text?.trim(), clientWs, sessionId);
-        });
+    // 🆕 Notificar al cliente que ya está listo
+    clientWs.send(JSON.stringify({ 
+      type: "ready", 
+      message: "Service connected and ready" 
+    }));
 
-        connection.on(RealtimeEvents.ERROR, (err) => console.error("❌ ElevenLabs Error:", err));
-        
-        connection.on(RealtimeEvents.CLOSE, () => {
-            isConnected = false;
-            if (keepAliveInterval) clearInterval(keepAliveInterval);
-        });
+    keepAliveInterval = setInterval(() => {
+      if (!isConnected || !connection) return;
 
-        clientWs.send(JSON.stringify({ type: "ready", message: "Service ready" }));
+      const timeSinceLastAudio = Date.now() - lastAudioTime;
+      
+      if (timeSinceLastAudio > 2000) {
+        try {
+          const silenceBuffer = Buffer.alloc(1024, 0);
+          connection.send({
+            audioBase64: silenceBuffer.toString("base64"),
+            sampleRate: 16000,
+          });
+        } catch (err) {
+          console.error("❌ Keep-alive error:", err);
+        }
+      }
+    }, 2000);
 
-        keepAliveInterval = setInterval(() => {
-            if (isConnected && connection && (Date.now() - lastAudioTime > 2000)) {
-                try {
-                    const silence = Buffer.alloc(1024, 0);
-                    connection.send({ audioBase64: silence.toString("base64"), sampleRate: 16000 });
-                } catch (e) { console.error("Keep-alive error", e); }
+    connection.on(RealtimeEvents.PARTIAL_TRANSCRIPT, (transcript) => {
+      clientWs.send(JSON.stringify({ type: "partial", data: transcript }));
+    });
+
+    connection.on(RealtimeEvents.COMMITTED_TRANSCRIPT, async (transcript) => {
+      clientWs.send(JSON.stringify({ type: "final", data: transcript }));
+      
+      const text = transcript.text?.trim();
+      if (!text) return;
+
+      try {
+        clientWs.send(JSON.stringify({ type: "thinking" }));
+
+        let pendingText = "";
+        let ttsQueue = Promise.resolve();
+
+        for await (const event of streamBedrockAgent(text, sessionId)) {
+          if (event.type === "chunk") {
+            pendingText += event.text;
+
+            const cleanedChunk = cleanTextForTTS(event.text);
+            const cleanedAccumulated = cleanTextForTTS(event.accumulated);
+
+            clientWs.send(JSON.stringify({
+              type: "agent_text_chunk",
+              chunk: cleanedChunk, 
+              accumulated: cleanedAccumulated,
+            }));
+
+            const { sentences, remaining } = extractCompleteSentences(pendingText);
+            
+            if (sentences) {
+              const cleanedSentences = cleanTextForTTS(sentences);
+
+              if (cleanedSentences) {
+                clientWs.send(JSON.stringify({
+                  type: "agent_tts_text",
+                  text: cleanedSentences
+                }));
+
+                ttsQueue = ttsQueue.then(() =>
+                  streamTextToSpeechPCM(cleanedSentences, clientWs)
+                );
+              }
+              pendingText = remaining;
             }
-        }, 2000);
+          }
+          
+          if (event.type === "complete") {
+            sessionId = event.sessionId;
+            
+            if (pendingText.trim()) {
+              const cleanedPending = cleanTextForTTS(pendingText);
+              if (cleanedPending) {
+                clientWs.send(JSON.stringify({
+                  type: "agent_tts_text",
+                  text: cleanedPending
+                }));
 
-        clientWs.on("message", async (message) => {
-            if (typeof message === "string" || (Buffer.isBuffer(message) && message.length < 500)) {
-                try {
-                    const data = JSON.parse(message.toString());
-                      // index.js -> dentro de clientWs.on("message")
-                      if (data.type === "text_input") {
-                          console.log("✍️ Nueva entrada de texto (Interrupción):", data.text);
-                          
-                          // Al llamar a processUserIntent, el await asegura que se procese, 
-                          // pero el sessionId actualizado permite que Bedrock sepa que es una continuación.
-                          sessionId = await processUserIntent(data.text, clientWs, sessionId);
-                          return;
-                      }
-                    if (data.event === "stop" && isConnected) connection.commit();
-                } catch (e) { /* Not JSON */ }
-            } else if (isConnected && connection) {
-                lastAudioTime = Date.now();
-                connection.send({ audioBase64: Buffer.from(message).toString("base64"), sampleRate: 16000 });
+                ttsQueue = ttsQueue.then(() =>
+                  streamTextToSpeechPCM(cleanedPending, clientWs)
+                );
+              }
             }
-        });
 
-        clientWs.on("close", () => {
-            if (keepAliveInterval) clearInterval(keepAliveInterval);
-            if (connection) connection.close();
-            isConnected = false;
-        });
+            await ttsQueue;
 
-    } catch (err) {
-        console.error("❌ Connection failed:", err);
-        if (clientWs.readyState === 1) clientWs.send(JSON.stringify({ type: "error", error: "Service Unavailable" }));
+            clientWs.send(JSON.stringify({
+              type: "agent_complete",
+              text: cleanTextForTTS(event.text),
+            }));
+          }
+        }
+      } catch (err) {
+        console.error("❌ Error:", err);
+        clientWs.send(JSON.stringify({
+          type: "error",
+          error: err.message || "Agent failed",
+        }));
+      }
+    });
+
+    connection.on(RealtimeEvents.ERROR, (error) => {
+      console.error("❌ ElevenLabs error:", error);
+      clientWs.send(JSON.stringify({ type: "error", error }));
+    });
+
+    connection.on(RealtimeEvents.CLOSE, () => {
+      console.log("🔌 ElevenLabs connection closed");
+      isConnected = false;
+      
+      if (keepAliveInterval) {
+        clearInterval(keepAliveInterval);
+        keepAliveInterval = null;
+      }
+    });
+
+    clientWs.on("message", (message) => {
+      if (typeof message === "string") {
+        try {
+          const data = JSON.parse(message);
+          if (data.event === "stop" && isConnected && connection) {
+            connection.commit();
+          }
+        } catch (err) {
+          console.error("❌ Error parsing message:", err);
+        }
+        return;
+      }
+
+      // 🆕 Verificar que la conexión esté lista antes de enviar audio
+      if (!isConnected || !connection) {
+        console.warn("⚠️ Audio received but connection not ready, ignoring");
+        return;
+      }
+
+      lastAudioTime = Date.now();
+
+      try {
+        const audioBuffer = Buffer.from(message);
+        connection.send({
+          audioBase64: audioBuffer.toString("base64"),
+          sampleRate: 16000,
+        });
+      } catch (err) {
+        console.error("❌ Error sending audio:", err);
+        isConnected = false;
+      }
+    });
+
+    clientWs.on("close", () => {
+      console.log("❌ Client disconnected");
+
+      if (keepAliveInterval) {
+        clearInterval(keepAliveInterval);
+        keepAliveInterval = null;
+      }
+
+      if (isConnected && connection) {
+        try {
+          connection.close();
+        } catch (err) {
+          console.error("Error closing connection:", err.message);
+        }
+      }
+
+      isConnected = false;
+    });
+
+  } catch (err) {
+    console.error("❌ Failed to establish connection after all retries:", err);
+    isConnected = false;
+
+    if (keepAliveInterval) {
+      clearInterval(keepAliveInterval);
     }
+    
+    if (clientWs.readyState === clientWs.OPEN) {
+      clientWs.send(JSON.stringify({
+        type: "connection_failed",
+        error: "Could not connect to speech service. Server may be starting up. Please refresh in a few seconds.",
+      }));
+      // 🆕 No cerrar inmediatamente, dar tiempo al cliente para mostrar el mensaje
+      setTimeout(() => {
+        if (clientWs.readyState === clientWs.OPEN) {
+          clientWs.close();
+        }
+      }, 2000);
+    }
+  }
 });
