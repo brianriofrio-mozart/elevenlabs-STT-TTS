@@ -16,7 +16,7 @@ const app = express();
 
 app.use(cors({
   origin: [
-    'https://elevenlabs-front-six.vercel.app',
+    'https://crisalia-agente.vercel.app',
     'http://localhost:5173',
     'http://localhost:3000'
   ],
