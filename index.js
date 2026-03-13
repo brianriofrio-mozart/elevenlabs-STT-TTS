@@ -24,7 +24,6 @@ app.use(cors({
   credentials: true
 }));
 
-// 🆕 Health check endpoint
 app.get('/health', (req, res) => {
   res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
@@ -47,7 +46,6 @@ const bedrockClient = new BedrockAgentRuntimeClient({
   },
 });
 
-// 🆕 Función auxiliar para esperar conexión con retry
 async function connectWithRetry(connectFn, maxRetries = 5, delayMs = 1000) {
   for (let i = 0; i < maxRetries; i++) {
     try {
@@ -251,6 +249,92 @@ function extractCompleteSentences(text) {
   return { sentences, remaining };
 }
 
+// ═══════════════════════════════════════════════════════════════
+// 🆕 FUNCIÓN EXTRAÍDA: procesar query con Bedrock + TTS opcional
+// ═══════════════════════════════════════════════════════════════
+async function handleAgentQuery(text, sessionId, clientWs, enableTTS = true) {
+  try {
+    clientWs.send(JSON.stringify({ type: "thinking" }));
+
+    let pendingText = "";
+    let ttsQueue = Promise.resolve();
+    let finalSessionId = sessionId;
+
+    for await (const event of streamBedrockAgent(text, sessionId)) {
+      if (event.type === "chunk") {
+        pendingText += event.text;
+
+        const cleanedChunk = cleanTextForTTS(event.text);
+        const cleanedAccumulated = cleanTextForTTS(event.accumulated);
+
+        clientWs.send(JSON.stringify({
+          type: "agent_text_chunk",
+          chunk: cleanedChunk, 
+          accumulated: cleanedAccumulated,
+        }));
+
+        if (enableTTS) {
+          const { sentences, remaining } = extractCompleteSentences(pendingText);
+          
+          if (sentences) {
+            const cleanedSentences = cleanTextForTTS(sentences);
+
+            if (cleanedSentences) {
+              clientWs.send(JSON.stringify({
+                type: "agent_tts_text",
+                text: cleanedSentences
+              }));
+
+              ttsQueue = ttsQueue.then(() =>
+                streamTextToSpeechPCM(cleanedSentences, clientWs)
+              );
+            }
+            pendingText = remaining;
+          }
+        }
+      }
+      
+      if (event.type === "complete") {
+        finalSessionId = event.sessionId;
+        
+        if (enableTTS && pendingText.trim()) {
+          const cleanedPending = cleanTextForTTS(pendingText);
+          if (cleanedPending) {
+            clientWs.send(JSON.stringify({
+              type: "agent_tts_text",
+              text: cleanedPending
+            }));
+
+            ttsQueue = ttsQueue.then(() =>
+              streamTextToSpeechPCM(cleanedPending, clientWs)
+            );
+          }
+        }
+
+        if (enableTTS) {
+          await ttsQueue;
+        }
+
+        clientWs.send(JSON.stringify({
+          type: "agent_complete",
+          text: cleanTextForTTS(event.text),
+        }));
+      }
+    }
+
+    return finalSessionId;
+  } catch (err) {
+    console.error("❌ Error in handleAgentQuery:", err);
+    clientWs.send(JSON.stringify({
+      type: "error",
+      error: err.message || "Agent failed",
+    }));
+    return sessionId;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+
 wss.on("connection", async (clientWs) => {
   console.log("✅ Client connected");
 
@@ -260,14 +344,12 @@ wss.on("connection", async (clientWs) => {
   let lastAudioTime = Date.now();
   let sessionId = null;
 
-  // 🆕 Notificar al cliente que está inicializando
   clientWs.send(JSON.stringify({ 
     type: "initializing", 
     message: "Connecting to speech service..." 
   }));
 
   try {
-    // 🆕 Usar la función de retry para conectar
     connection = await connectWithRetry(async () => {
       return await elevenlabs.speechToText.realtime.connect({
         modelId: "scribe_v2_realtime",
@@ -281,11 +363,10 @@ wss.on("connection", async (clientWs) => {
         minSpeechDurationMs: 150,
         minSilenceDurationMs: 300,
       });
-    }, 5, 2000); // 5 intentos, 2 segundos entre cada uno
+    }, 5, 2000);
 
     isConnected = true;
 
-    // 🆕 Notificar al cliente que ya está listo
     clientWs.send(JSON.stringify({ 
       type: "ready", 
       message: "Service connected and ready" 
@@ -319,76 +400,8 @@ wss.on("connection", async (clientWs) => {
       const text = transcript.text?.trim();
       if (!text) return;
 
-      try {
-        clientWs.send(JSON.stringify({ type: "thinking" }));
-
-        let pendingText = "";
-        let ttsQueue = Promise.resolve();
-
-        for await (const event of streamBedrockAgent(text, sessionId)) {
-          if (event.type === "chunk") {
-            pendingText += event.text;
-
-            const cleanedChunk = cleanTextForTTS(event.text);
-            const cleanedAccumulated = cleanTextForTTS(event.accumulated);
-
-            clientWs.send(JSON.stringify({
-              type: "agent_text_chunk",
-              chunk: cleanedChunk, 
-              accumulated: cleanedAccumulated,
-            }));
-
-            const { sentences, remaining } = extractCompleteSentences(pendingText);
-            
-            if (sentences) {
-              const cleanedSentences = cleanTextForTTS(sentences);
-
-              if (cleanedSentences) {
-                clientWs.send(JSON.stringify({
-                  type: "agent_tts_text",
-                  text: cleanedSentences
-                }));
-
-                ttsQueue = ttsQueue.then(() =>
-                  streamTextToSpeechPCM(cleanedSentences, clientWs)
-                );
-              }
-              pendingText = remaining;
-            }
-          }
-          
-          if (event.type === "complete") {
-            sessionId = event.sessionId;
-            
-            if (pendingText.trim()) {
-              const cleanedPending = cleanTextForTTS(pendingText);
-              if (cleanedPending) {
-                clientWs.send(JSON.stringify({
-                  type: "agent_tts_text",
-                  text: cleanedPending
-                }));
-
-                ttsQueue = ttsQueue.then(() =>
-                  streamTextToSpeechPCM(cleanedPending, clientWs)
-                );
-              }
-            }
-
-            await ttsQueue;
-
-            clientWs.send(JSON.stringify({
-              type: "agent_complete",
-              text: cleanTextForTTS(event.text),
-            }));
-          }
-        }
-      } catch (err) {
-        console.error("❌ Error:", err);
-        clientWs.send(JSON.stringify({
-          type: "error",
-          error: err.message || "Agent failed",
-        }));
-      }
+      // 🆕 Usar la función extraída (voz siempre con TTS)
+      sessionId = await handleAgentQuery(text, sessionId, clientWs, true);
     });
 
     connection.on(RealtimeEvents.ERROR, (error) => {
@@ -406,10 +419,80 @@ wss.on("connection", async (clientWs) => {
       }
     });
 
-    clientWs.on("message", (message) => {
+    clientWs.on("message", async (message) => {
+      // ws puede entregar mensajes de texto como Buffer — intentar parsear JSON primero
+      if (typeof message !== "string" && Buffer.isBuffer(message)) {
+        // Intentar decodificar como JSON (mensaje de texto del cliente)
+        try {
+          const str = message.toString("utf-8");
+          const data = JSON.parse(str);
+
+          // Si parseó como JSON, es un mensaje de control/texto
+          if (data.event === "text_message") {
+            const text = data.text?.trim();
+            if (!text) return;
+
+            console.log(`💬 Text message received: "${text}"`);
+
+            clientWs.send(JSON.stringify({
+              type: "text_received",
+              text: text,
+            }));
+
+            const enableTTS = data.enableTTS === true;
+            sessionId = await handleAgentQuery(text, sessionId, clientWs, enableTTS);
+            return;
+          }
+
+          if (data.event === "stop" && isConnected && connection) {
+            connection.commit();
+          }
+          return;
+        } catch (e) {
+          // No es JSON → es audio binario, continuar abajo
+        }
+
+        // Audio binario
+        if (!isConnected || !connection) {
+          console.warn("⚠️ Audio received but connection not ready, ignoring");
+          return;
+        }
+
+        lastAudioTime = Date.now();
+
+        try {
+          connection.send({
+            audioBase64: message.toString("base64"),
+            sampleRate: 16000,
+          });
+        } catch (err) {
+          console.error("❌ Error sending audio:", err);
+          isConnected = false;
+        }
+        return;
+      }
+
+      // String nativo (por si acaso)
       if (typeof message === "string") {
         try {
           const data = JSON.parse(message);
+
+          if (data.event === "text_message") {
+            const text = data.text?.trim();
+            if (!text) return;
+
+            console.log(`💬 Text message received: "${text}"`);
+
+            clientWs.send(JSON.stringify({
+              type: "text_received",
+              text: text,
+            }));
+
+            const enableTTS = data.enableTTS === true;
+            sessionId = await handleAgentQuery(text, sessionId, clientWs, enableTTS);
+            return;
+          }
+
           if (data.event === "stop" && isConnected && connection) {
             connection.commit();
           }
@@ -417,25 +500,6 @@ wss.on("connection", async (clientWs) => {
           console.error("❌ Error parsing message:", err);
         }
         return;
-      }
-
-      // 🆕 Verificar que la conexión esté lista antes de enviar audio
-      if (!isConnected || !connection) {
-        console.warn("⚠️ Audio received but connection not ready, ignoring");
-        return;
-      }
-
-      lastAudioTime = Date.now();
-
-      try {
-        const audioBuffer = Buffer.from(message);
-        connection.send({
-          audioBase64: audioBuffer.toString("base64"),
-          sampleRate: 16000,
-        });
-      } catch (err) {
-        console.error("❌ Error sending audio:", err);
-        isConnected = false;
       }
     });
 
@@ -471,7 +535,6 @@ wss.on("connection", async (clientWs) => {
         type: "connection_failed",
         error: "Could not connect to speech service. Server may be starting up. Please refresh in a few seconds.",
       }));
-      // 🆕 No cerrar inmediatamente, dar tiempo al cliente para mostrar el mensaje
       setTimeout(() => {
         if (clientWs.readyState === clientWs.OPEN) {
           clientWs.close();
