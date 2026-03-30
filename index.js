@@ -447,6 +447,12 @@ wss.on("connection", async (clientWs) => {
           if (data.event === "stop" && isConnected && connection) {
             connection.commit();
           }
+
+          if (data.event === "new_conversation") {
+            sessionId = null;
+            console.log("🆕 New conversation started, sessionId reset");
+            clientWs.send(JSON.stringify({ type: "conversation_reset" }));
+          }
           return;
         } catch (e) {
           // No es JSON → es audio binario, continuar abajo
@@ -495,6 +501,12 @@ wss.on("connection", async (clientWs) => {
 
           if (data.event === "stop" && isConnected && connection) {
             connection.commit();
+          }
+
+          if (data.event === "new_conversation") {
+            sessionId = null;
+            console.log("🆕 New conversation started, sessionId reset");
+            clientWs.send(JSON.stringify({ type: "conversation_reset" }));
           }
         } catch (err) {
           console.error("❌ Error parsing message:", err);
